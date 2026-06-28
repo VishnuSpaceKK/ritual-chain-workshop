@@ -1,57 +1,89 @@
-# Sample Hardhat 3 Project (`node:test` and `viem`)
+## The Problem This Solves
 
-This project showcases a Hardhat 3 project using the native Node.js test runner (`node:test`) and the `viem` library for Ethereum interactions.
+The original `AIJudge` contract stored every submitted answer in plaintext, immediately,
+on-chain. Anyone watching the chain (or even just calling `getSubmission`) could read
+every answer the moment it was submitted — including other participants, before the
+bounty's deadline even passed. That meant a later submitter could simply copy an
+earlier answer, tweak it slightly, and resubmit an "improved" version with no original
+thought required.
 
-To learn more about Hardhat 3, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3](https://hardhat.org/hardhat3-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+This version fixes that using a **commit-reveal scheme**: participants submit only a
+cryptographic hash of their answer during the submission window. The actual answer
+stays completely hidden — even from other participants and the bounty owner — until a
+separate, later reveal phase. By the time anyone can read your answer, the window for
+submitting new entries has already closed, so there's nothing left to copy from you.
 
-## Project Overview
+## Lifecycle
 
-This example project includes:
+A bounty moves through four phases, in order:
 
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using [`node:test`](nodejs.org/api/test.html), the new Node.js native test runner, and [`viem`](https://viem.sh/).
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
+### 1. Create
+`createBounty(title, rubric, commitDeadline, revealDeadline)` — bounty owner deposits
+the reward (in native currency) and sets two deadlines:
+- `commitDeadline` — the last moment to submit a commitment
+- `revealDeadline` — the last moment to reveal an answer (must be later than `commitDeadline`)
 
-## Usage
-
-### Running Tests
-
-To run all the tests in the project, execute the following command:
-
-```shell
-npx hardhat test
+### 2. Commit phase (`block.timestamp < commitDeadline`)
+Each participant calls:
+```solidity
+submitCommitment(bountyId, commitment)
 ```
+where `commitment = keccak256(abi.encodePacked(answer, salt, msg.sender, bountyId))`.
 
-You can also selectively run the Solidity or `node:test` tests:
+The `salt` is a random secret only the participant knows — without it, nobody (not
+even the contract) can reverse the hash back into the original answer. Including
+`msg.sender` and `bountyId` in the hash means a commitment can't be replayed by someone
+else or reused across a different bounty.
 
-```shell
-npx hardhat test solidity
-npx hardhat test nodejs
+At this stage, **only the hash is stored on-chain** (`Submission.answer` stays empty).
+No one — including the bounty owner — can see what was submitted.
+
+### 3. Reveal phase (`commitDeadline ≤ block.timestamp < revealDeadline`)
+Each participant who committed now calls:
+```solidity
+revealAnswer(bountyId, answer, salt)
 ```
+The contract recomputes `keccak256(answer, salt, msg.sender, bountyId)` and checks it
+matches the commitment submitted earlier. If it matches, the plaintext answer is now
+stored and visible. If it doesn't match — wrong answer, wrong salt, or someone trying
+to claim a commitment that isn't theirs — the transaction reverts.
 
-### Make a deployment to Sepolia
+By the time reveals start, the **commit window is already closed**, so nobody can
+react to anyone else's revealed answer by submitting a new, "improved" entry of their
+own — there's no submission phase left to exploit.
 
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
-
-To run the deployment to a local chain:
-
-```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
+### 4. Judge
+Once `revealDeadline` has passed, the bounty owner calls:
+```solidity
+judgeAll(bountyId, llmInput)
 ```
+This sends all **revealed** answers to Ritual's on-chain LLM inference precompile for
+evaluation, and stores the AI's review on-chain. Unrevealed commitments are simply
+excluded — if you didn't reveal in time, your answer is never judged.
 
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
-
-```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
+### 5. Finalize
+```solidity
+finalizeWinner(bountyId, winnerIndex)
 ```
+The bounty owner picks the winning index from the judged, revealed submissions, and the
+reward is paid out automatically. The contract enforces that the winner must be a
+submission that was actually revealed — you cannot win with an unrevealed commitment.
 
-After setting the variable, you can run the deployment with the Sepolia network:
+## Key Security Properties
 
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
-```
+| Property | How it's enforced |
+|---|---|
+| Answers can't be read before reveal | Only the hash is stored during the commit phase; `answer` field stays empty |
+| Can't copy someone else's idea | By the time any answer is visible, the commit window for new entries is already closed |
+| Can't impersonate another submitter | `msg.sender` is baked into the commitment hash |
+| Can't replay a commitment across bounties | `bountyId` is baked into the commitment hash |
+| Can't submit twice | `submitCommitment` reverts if the sender already has an entry for this bounty |
+| Can't reveal twice | `revealAnswer` reverts if `submission.revealed` is already true |
+| Can't win without revealing | `finalizeWinner` requires the chosen index to have `revealed == true` |
+| Judging can't happen early | `judgeAll` requires `block.timestamp >= revealDeadline` |
+
+## Known Limitations (honest, not hidden)
+
+- **The salt only protects against the public/other participants — it doesn't protect against the bounty owner colluding with a node operator to read pending mempool transactions before they're mined.** This contract makes data *unreadable by reading chain state*, but it doesn't address mempool-level privacy. The Advanced Track (Ritual-native TEE submissions) addresses this gap — see `ARCHITECTURE.md`.
+- If a participant loses their `salt`, their answer can never be revealed or verified — there's no recovery mechanism by design, since recovery would require storing the salt somewhere, defeating its purpose.
+- `MAX_SUBMISSIONS = 10` and `MAX_ANSWER_LENGTH = 2,000` are unchanged from the original contract — these are gas/storage safety limits, not security features.
